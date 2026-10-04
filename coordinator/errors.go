@@ -58,4 +58,6 @@ var (
     ErrNotResumable = errors.New("coordinator: task is already in a terminal state")
     // ErrPaused 表示任务被操作者暂停，当前调用到此为止。
     ErrPaused = errors.New("coordinator: task paused by operator")
+    // ErrTaskNotFound 表示按任务身份找不到协调记录。
+    ErrTaskNotFound = errors.New("coordinator: task not found")
 )
