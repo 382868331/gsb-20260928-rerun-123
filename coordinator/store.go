@@ -18,7 +18,7 @@ type StepRecord struct {
     Attempts   int    `json:"attempts"`
     Result     string `json:"result"`               // 最近一次确认结果
     Detail     string `json:"detail,omitempty"`    // 失败原因等
-    EffectKey  string `json:"effect_key,omitempty" // 业务方返回的幂等效果标识
+    EffectKey  string `json:"effect_key,omitempty"` // 业务方返回的幂等效果标识
     UpdatedAt  string `json:"updated_at"`
 }
 
