@@ -80,7 +80,7 @@ func TestUnknownUnresolvedPauses(t *testing.T) {
 func TestFailureTriggersCompensation(t *testing.T) {
 	coord, store, _ := newTestEnv(t)
 	ctx := context.Background()
-    refunded := false
+	refunded := false
 	steps := []Step{
 		{Name: "charge", Forward: okOp("charged"), Compensate: Op{
 			Do: func(ctx context.Context) (Outcome, string, error) { refunded = true; return Success, "refunded", nil },
@@ -148,6 +148,135 @@ func TestDisputeEvidenceRulingAndWithdrawal(t *testing.T) {
 		t.Fatalf("re-execute after withdrawal = %v, want ErrActionAlreadyDone", err)
 	}
 	_ = store
+}
+
+func TestRulingGateChecksEveryLaterActionIncludingQuery(t *testing.T) {
+	coord, store, dm := newTestEnv(t)
+	ctx := context.Background()
+
+	refundCalls := 0
+	releaseCalls := 0
+	shippingQueryCalls := 0
+	steps := []Step{
+		{Name: "refund", Forward: Op{
+			Do: func(context.Context) (Outcome, string, error) {
+				refundCalls++
+				return Success, "refunded", nil
+			},
+		}},
+		{Name: "release", Forward: Op{
+			Do: func(context.Context) (Outcome, string, error) {
+				releaseCalls++
+				return Success, "released", nil
+			},
+		}},
+		{Name: "shipping", Forward: Op{
+			Do: func(context.Context) (Outcome, string, error) {
+				return Unknown, "", ErrUnknownResult
+			},
+			Query: func(context.Context) (Outcome, string, error) {
+				shippingQueryCalls++
+				return Unknown, "", ErrUnknownResult
+			},
+		}},
+	}
+
+	now := "2026-10-05T00:00:00Z"
+	if _, err := store.Create(ctx, &TaskRecord{
+		TaskID:    "t5",
+		Key:       "k5",
+		Status:    StPaused,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Steps: []StepRecord{
+			{Name: "refund", Status: StepSucceeded, Attempts: 1, Result: Success.String(), UpdatedAt: now},
+			{Name: "release", Status: StepSucceeded, Attempts: 1, Result: Success.String(), UpdatedAt: now},
+			{Name: "shipping", Status: StepUnknown, Attempts: 1, Result: Unknown.String(), UpdatedAt: now},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := dm.Open(ctx, "t5", "refund", "manual payment review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dm.AddObservation(ctx, d.ID, "support", "success", "refund receipt"); err != nil {
+		t.Fatal(err)
+	}
+	d, _ = dmStoreLoad(dm, ctx, d.ID)
+	basis := []string{d.Observations[0].ID}
+	ruled, err := dm.Rule(ctx, d.ID, "refund", []string{"release"}, basis, "op")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruled.ExecutedActions = []string{"refund", "release"}
+	if err := dm.store.Save(ctx, ruled); err != nil {
+		t.Fatal(err)
+	}
+	d = ruled
+
+	if err := coord.Resume(ctx, "t5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := coord.Run(ctx, "t5", "k5", steps); !errors.Is(err, ErrPaused) {
+		t.Fatalf("run unauthorized shipping query = %v, want ErrPaused", err)
+	}
+	if refundCalls != 0 || releaseCalls != 0 {
+		t.Fatalf("confirmed actions were re-executed: refund=%d release=%d", refundCalls, releaseCalls)
+	}
+	if shippingQueryCalls != 0 {
+		t.Fatalf("shipping query executed %d times without authorization", shippingQueryCalls)
+	}
+	if _, err := dm.ExecuteAction(ctx, d.ID, "shipping"); !errors.Is(err, ErrActionNotAllowed) {
+		t.Fatalf("shipping permission = %v, want ErrActionNotAllowed", err)
+	}
+	d, err = dm.AddObservation(ctx, d.ID, "bank", "failed", "refund absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dm.ExecuteAction(ctx, d.ID, "shipping"); !errors.Is(err, ErrDisputePaused) {
+		t.Fatalf("shipping permission while paused = %v, want ErrDisputePaused", err)
+	}
+	if _, err := dm.ExecuteAction(ctx, d.ID, "release"); !errors.Is(err, ErrDisputePaused) {
+		t.Fatalf("release while paused = %v, want ErrDisputePaused", err)
+	}
+	if err := coord.Resume(ctx, "t5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := coord.Run(ctx, "t5", "k5", steps); !errors.Is(err, ErrPaused) {
+		t.Fatalf("run paused shipping query = %v, want ErrPaused", err)
+	}
+	if shippingQueryCalls != 0 {
+		t.Fatalf("paused shipping query executed %d times", shippingQueryCalls)
+	}
+
+	if _, err := dm.Withdraw(ctx, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dm.Rule(ctx, d.ID, "refund", []string{"release"}, basis, "op2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dm.ExecuteAction(ctx, d.ID, "refund"); !errors.Is(err, ErrActionAlreadyDone) {
+		t.Fatalf("refund after re-ruling = %v, want ErrActionAlreadyDone", err)
+	}
+	if err := coord.Resume(ctx, "t5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := coord.Run(ctx, "t5", "k5", steps); !errors.Is(err, ErrPaused) {
+		t.Fatalf("run shipping after re-ruling = %v, want ErrPaused", err)
+	}
+	if shippingQueryCalls != 0 || refundCalls != 0 || releaseCalls != 0 {
+		t.Fatalf("calls after re-ruling: refund=%d release=%d shippingQuery=%d; all known effects must remain skipped", refundCalls, releaseCalls, shippingQueryCalls)
+	}
+	d, _ = dmStoreLoad(dm, ctx, d.ID)
+	if len(d.Observations) != 2 || len(d.Rulings) != 2 || len(d.ExecutedActions) != 2 {
+		t.Fatalf("history not retained: observations=%d rulings=%d executed=%d", len(d.Observations), len(d.Rulings), len(d.ExecutedActions))
+	}
+	rec, _ := store.Load(ctx, "t5")
+	if rec.Status != StPaused || rec.Steps[2].Status != StepUnknown {
+		t.Fatalf("record = %+v, want shipping still unknown and task paused", rec)
+	}
 }
 
 func dmStoreLoad(dm *DisputeManager, ctx context.Context, id string) (*Dispute, error) {

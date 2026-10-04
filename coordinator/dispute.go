@@ -69,12 +69,32 @@ type Dispute struct {
 
 // ActiveRuling 返回当前生效（未撤回）的裁决，没有则返回 nil。
 func (d *Dispute) ActiveRuling() *Ruling {
-	for i := len(d.Rulings) - 1; i >= 0; i-- {
-		if !d.Rulings[i].Withdrawn {
-			return &d.Rulings[i]
+    for i := len(d.Rulings) - 1; i >= 0; i-- {
+        if !d.Rulings[i].Withdrawn {
+            return &d.Rulings[i]
 		}
 	}
-	return nil
+    return nil
+}
+
+// CurrentRuling 返回争议当前处于生效状态的裁决。暂停或重审中的裁决不能授权业务动作。
+func (d *Dispute) CurrentRuling() *Ruling {
+	if d.Status != DsRuled {
+		return nil
+	}
+	return d.ActiveRuling()
+}
+
+func rulingAllows(r *Ruling, action string) bool {
+	if r.Action == action {
+		return true
+	}
+	for _, allowed := range r.AllowedNext {
+		if allowed == action {
+			return true
+		}
+	}
+	return false
 }
 
 // DisputeStore 以 JSON 文件持久化争议记录（临时文件 + rename 原子写入）。
@@ -163,7 +183,13 @@ type DisputeManager struct {
 }
 
 func NewDisputeManager(store *DisputeStore, coord *Coordinator) *DisputeManager {
-	return &DisputeManager{store: store, coord: coord, now: time.Now}
+	m := &DisputeManager{store: store, coord: coord, now: time.Now}
+	if coord != nil {
+		coord.SetActionObserver(func(ctx context.Context, taskID, action string) error {
+			return m.RecordExecutedAction(ctx, taskID, action)
+		})
+	}
+	return m
 }
 
 func (m *DisputeManager) ts() string { return m.now().UTC().Format(time.RFC3339Nano) }
@@ -316,17 +342,11 @@ func (m *DisputeManager) ExecuteAction(ctx context.Context, disputeID, action st
 	if d.Status == DsPaused {
 		return nil, ErrDisputePaused
 	}
-	r := d.ActiveRuling()
+	r := d.CurrentRuling()
 	if r == nil {
 		return nil, ErrNoActiveRuling
 	}
-	allowed := action == r.Action
-	for _, a := range r.AllowedNext {
-		if a == action {
-			allowed = true
-		}
-	}
-	if !allowed {
+	if !rulingAllows(r, action) {
 		return nil, ErrActionNotAllowed
 	}
 	for _, done := range d.ExecutedActions {
@@ -337,6 +357,36 @@ func (m *DisputeManager) ExecuteAction(ctx context.Context, disputeID, action st
 	d.ExecutedActions = append(d.ExecutedActions, action)
 	d.UpdatedAt = m.ts()
 	return d, m.store.Save(ctx, d)
+}
+
+// RecordExecutedAction 把协调器已确认发生的业务动作追加到该任务相关争议中。
+// 记录按整个争议生命周期去重，撤回或重新裁决不会清除。
+func (m *DisputeManager) RecordExecutedAction(ctx context.Context, taskID, action string) error {
+	disputes, err := m.store.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, d := range disputes {
+		if d.TaskID != taskID {
+			continue
+		}
+		already := false
+		for _, done := range d.ExecutedActions {
+			if done == action {
+				already = true
+				break
+			}
+		}
+		if already {
+			continue
+		}
+		d.ExecutedActions = append(d.ExecutedActions, action)
+		d.UpdatedAt = m.ts()
+		if err := m.store.Save(ctx, d); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Gate 实现 coordinator.Gate：争议暂停或裁决未允许的步骤必须等待。
@@ -353,15 +403,16 @@ func (m *DisputeManager) Gate(ctx context.Context) Gate {
 			if d.Status == DsPaused {
 				return fmt.Errorf("%w: %s", ErrDisputePaused, d.ID)
 			}
-			if r := d.ActiveRuling(); r != nil && d.StepName == stepName {
-				allowed := false
-				for _, a := range r.AllowedNext {
-					if a == stepName {
-						allowed = true
-					}
-				}
-				if !allowed {
-					return fmt.Errorf("%w: step %s not in ruling %s allowed_next", ErrActionNotAllowed, stepName, r.ID)
+			r := d.CurrentRuling()
+			if r == nil {
+				return fmt.Errorf("%w: dispute %s has no active ruling", ErrNoActiveRuling, d.ID)
+			}
+			if !rulingAllows(r, stepName) {
+				return fmt.Errorf("%w: step %s not explicitly authorized by ruling %s", ErrActionNotAllowed, stepName, r.ID)
+			}
+			for _, done := range d.ExecutedActions {
+				if done == stepName {
+					return fmt.Errorf("%w: %s", ErrActionAlreadyDone, stepName)
 				}
 			}
 		}

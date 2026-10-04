@@ -25,11 +25,15 @@ type Step struct {
 // 争议管理器用它实现"裁决允许的后续步骤"与"矛盾证据导致的暂停"。
 type Gate func(taskID, stepName string) error
 
+// ActionObserver 在正向业务效果被确认发生后回调，可供争议管理器保留终身执行记录。
+type ActionObserver func(ctx context.Context, taskID, actionName string) error
+
 // Coordinator 基于持久记录驱动一次分布式事务的正向执行与补偿。
 type Coordinator struct {
-    store Store
-    gate  Gate
-    now   func() time.Time
+    store          Store
+    gate           Gate
+    actionObserver ActionObserver
+    now            func() time.Time
 }
 
 func NewCoordinator(store Store) *Coordinator {
@@ -38,6 +42,9 @@ func NewCoordinator(store Store) *Coordinator {
 
 // SetGate 挂接争议门禁；可为空。
 func (c *Coordinator) SetGate(g Gate) { c.gate = g }
+
+// SetActionObserver 设置业务动作成功确认后的审计回调。
+func (c *Coordinator) SetActionObserver(observer ActionObserver) { c.actionObserver = observer }
 
 func (c *Coordinator) ts() string { return c.now().UTC().Format(time.RFC3339Nano) }
 
@@ -85,6 +92,11 @@ func (c *Coordinator) Run(ctx context.Context, taskID, key string, steps []Step)
             continue
         case StepUnknown:
             // 效果未知：先查询核实，绝不盲目重试。
+            if c.gate != nil {
+                if err := c.gate(taskID, sr.Name); err != nil {
+                    return c.pause(ctx, rec, fmt.Sprintf("步骤 %s 查询被争议门禁拦下: %v", sr.Name, err))
+                }
+            }
             if err := c.resolveUnknown(ctx, rec, sr, def.Forward); err != nil {
                 return err
             }
@@ -93,6 +105,9 @@ func (c *Coordinator) Run(ctx context.Context, taskID, key string, steps []Step)
             }
             if sr.Status == StepFailed {
                 return c.compensate(ctx, rec, steps, i)
+            }
+            if err := c.observeSucceeded(ctx, taskID, sr); err != nil {
+                return err
             }
             continue
         case StepPending:
@@ -114,10 +129,18 @@ func (c *Coordinator) Run(ctx context.Context, taskID, key string, steps []Step)
             }
             switch sr.Status {
             case StepSucceeded:
+                if err := c.observeSucceeded(ctx, taskID, sr); err != nil {
+                    return err
+                }
                 continue
             case StepFailed:
                 return c.compensate(ctx, rec, steps, i)
             default: // unknown：先查询核实
+                if c.gate != nil {
+                    if err := c.gate(taskID, sr.Name); err != nil {
+                        return c.pause(ctx, rec, fmt.Sprintf("步骤 %s 查询被争议门禁拦下: %v", sr.Name, err))
+                    }
+                }
                 if err := c.resolveUnknown(ctx, rec, sr, def.Forward); err != nil {
                     return err
                 }
@@ -127,6 +150,11 @@ func (c *Coordinator) Run(ctx context.Context, taskID, key string, steps []Step)
                 if sr.Status == StepFailed {
                     return c.compensate(ctx, rec, steps, i)
                 }
+                if sr.Status == StepSucceeded {
+                    if err := c.observeSucceeded(ctx, taskID, sr); err != nil {
+                        return err
+                    }
+                }
             }
         default:
             return fmt.Errorf("coordinator: step %s in unexpected status %s", sr.Name, sr.Status)
@@ -135,6 +163,13 @@ func (c *Coordinator) Run(ctx context.Context, taskID, key string, steps []Step)
     rec.Status = StCommitted
     rec.UpdatedAt = c.ts()
     return c.store.Save(ctx, rec)
+}
+
+func (c *Coordinator) observeSucceeded(ctx context.Context, taskID string, sr *StepRecord) error {
+    if c.actionObserver != nil && sr.Status == StepSucceeded {
+        return c.actionObserver(ctx, taskID, sr.Name)
+    }
+    return nil
 }
 
 // resolveUnknown 用 Query 核实未知步骤；查询本身也可能丢失响应。
