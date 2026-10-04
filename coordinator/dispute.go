@@ -77,6 +77,28 @@ func (d *Dispute) ActiveRuling() *Ruling {
 	return nil
 }
 
+// Authorize 核对一个业务动作是否被当前有效裁决明确授权。
+// 争议暂停（裁决被新证据暂停）、没有生效裁决（未裁决或裁决已撤回）、
+// 或动作不在裁决的 Action/AllowedNext 明确授权范围内，均不得放行。
+func (d *Dispute) Authorize(action string) error {
+	if d.Status == DsPaused {
+		return fmt.Errorf("%w: %s", ErrDisputePaused, d.ID)
+	}
+	r := d.ActiveRuling()
+	if r == nil || d.Status != DsRuled {
+		return fmt.Errorf("%w: dispute %s", ErrNoActiveRuling, d.ID)
+	}
+	if action == r.Action {
+		return nil
+	}
+	for _, a := range r.AllowedNext {
+		if a == action {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: action %s not in ruling %s", ErrActionNotAllowed, action, r.ID)
+}
+
 // DisputeStore 以 JSON 文件持久化争议记录（临时文件 + rename 原子写入）。
 type DisputeStore struct {
 	mu  sync.Mutex
@@ -306,6 +328,24 @@ func (m *DisputeManager) Withdraw(ctx context.Context, disputeID string) (*Dispu
 // ExecuteAction 按当前生效裁决执行一个业务动作。
 // 同一动作在整个争议生命周期内只能执行一次，撤回裁决不会重置该限制。
 func (m *DisputeManager) ExecuteAction(ctx context.Context, disputeID, action string) (*Dispute, error) {
+	d, err := m.checkAction(ctx, disputeID, action)
+	if err != nil {
+		return nil, err
+	}
+	d.ExecutedActions = append(d.ExecutedActions, action)
+	d.UpdatedAt = m.ts()
+	return d, m.store.Save(ctx, d)
+}
+
+// CheckAction 查询某业务动作当前是否可执行，判定口径与 ExecuteAction 完全一致：
+// 必须被当前有效裁决明确授权，且同一动作终身只能执行一次。
+// 这样许可查询结果与实际执行结果一致，不会出现“放行却执行不了”或反之。
+func (m *DisputeManager) CheckAction(ctx context.Context, disputeID, action string) error {
+	_, err := m.checkAction(ctx, disputeID, action)
+	return err
+}
+
+func (m *DisputeManager) checkAction(ctx context.Context, disputeID, action string) (*Dispute, error) {
 	d, err := m.store.Load(ctx, disputeID)
 	if err != nil {
 		return nil, err
@@ -313,30 +353,15 @@ func (m *DisputeManager) ExecuteAction(ctx context.Context, disputeID, action st
 	if d == nil {
 		return nil, fmt.Errorf("coordinator: dispute %s not found", disputeID)
 	}
-	if d.Status == DsPaused {
-		return nil, ErrDisputePaused
-	}
-	r := d.ActiveRuling()
-	if r == nil {
-		return nil, ErrNoActiveRuling
-	}
-	allowed := action == r.Action
-	for _, a := range r.AllowedNext {
-		if a == action {
-			allowed = true
-		}
-	}
-	if !allowed {
-		return nil, ErrActionNotAllowed
+	if err := d.Authorize(action); err != nil {
+		return nil, err
 	}
 	for _, done := range d.ExecutedActions {
 		if done == action {
-			return nil, ErrActionAlreadyDone
+			return nil, fmt.Errorf("%w: %s", ErrActionAlreadyDone, action)
 		}
 	}
-	d.ExecutedActions = append(d.ExecutedActions, action)
-	d.UpdatedAt = m.ts()
-	return d, m.store.Save(ctx, d)
+	return d, nil
 }
 
 // Gate 实现 coordinator.Gate：争议暂停或裁决未允许的步骤必须等待。
@@ -350,19 +375,11 @@ func (m *DisputeManager) Gate(ctx context.Context) Gate {
 			if d.TaskID != taskID {
 				continue
 			}
-			if d.Status == DsPaused {
-				return fmt.Errorf("%w: %s", ErrDisputePaused, d.ID)
-			}
-			if r := d.ActiveRuling(); r != nil && d.StepName == stepName {
-				allowed := false
-				for _, a := range r.AllowedNext {
-					if a == stepName {
-						allowed = true
-					}
-				}
-				if !allowed {
-					return fmt.Errorf("%w: step %s not in ruling %s allowed_next", ErrActionNotAllowed, stepName, r.ID)
-				}
+			// 每个后续动作都必须被当前有效裁决明确授权：
+			// 未裁决、裁决已撤回、被新证据暂停或动作不在授权范围内，一律拦截，
+			// 与争议立案步骤名无关。
+			if err := d.Authorize(stepName); err != nil {
+				return err
 			}
 		}
 		return nil
