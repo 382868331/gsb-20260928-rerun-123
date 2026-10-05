@@ -6,8 +6,8 @@ package main
 
 import (
 	"context"
-    "encoding/json"
-    "fmt"
+	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,10 +17,10 @@ import (
 
 // fakeLedger 是虚构的账务服务，可脚本化"丢响应"。
 type fakeLedger struct {
-    balance    int
-    charged    map[string]int
-    loseReply  bool
-    loseQuery  bool
+	balance   int
+	charged   map[string]int
+	loseReply bool
+	loseQuery bool
 }
 
 func (l *fakeLedger) charge(key string, amount int) coordinator.Op {
@@ -38,12 +38,12 @@ func (l *fakeLedger) charge(key string, amount int) coordinator.Op {
 			}
 			return coordinator.Success, fmt.Sprintf("charged %d", amount), nil
 		},
-        Query: func(ctx context.Context) (coordinator.Outcome, string, error) {
-            if l.loseQuery {
-                l.loseQuery = false
-                return coordinator.Unknown, "", coordinator.ErrUnknownResult
-            }
-            if amt, ok := l.charged[key]; ok {
+		Query: func(ctx context.Context) (coordinator.Outcome, string, error) {
+			if l.loseQuery {
+				l.loseQuery = false
+				return coordinator.Unknown, "", coordinator.ErrUnknownResult
+			}
+			if amt, ok := l.charged[key]; ok {
 				return coordinator.Success, fmt.Sprintf("query: charge of %d found", amt), nil
 			}
 			return coordinator.Failed, "query: no charge found", nil
@@ -182,11 +182,11 @@ func main() {
 	ledger := &fakeLedger{balance: 1000}
 	inv := &fakeInventory{stock: 10}
 	order := &fakeOrder{}
-    ledger.loseReply = true // 扣款实际成功，但响应丢失
-    ledger.loseQuery = true // 第一次查询的响应也丢失
+	ledger.loseReply = true // 扣款实际成功，但响应丢失
+	ledger.loseQuery = true // 第一次查询的响应也丢失
 	steps := orderSteps(ledger, inv, order, "order-1", 100, 2)
-    err = coord.Run(ctx, "task-1", "order-1", steps)
-    why("第一次 Run 返回: %v（扣款响应丢失 -> 查询核实，查询响应也丢失 -> 暂停等待）", err)
+	err = coord.Run(ctx, "task-1", "order-1", steps)
+	why("第一次 Run 返回: %v（扣款响应丢失 -> 查询核实，查询响应也丢失 -> 暂停等待）", err)
 	showTask(coord, store, "task-1")
 	why("查询确认扣款已发生，因此可以继续；恢复任务后跑完预留与提交")
 	ledger.loseReply = false
@@ -215,8 +215,8 @@ func main() {
 	ledger3 := &fakeLedger{balance: 1000}
 	inv3 := &fakeInventory{stock: 10}
 	order3 := &fakeOrder{}
-    ledger3.loseReply = true
-    ledger3.loseQuery = true // 查询响应也丢失，任务停在 paused 等待核实
+	ledger3.loseReply = true
+	ledger3.loseQuery = true // 查询响应也丢失，任务停在 paused 等待核实
 	steps3 := orderSteps(ledger3, inv3, order3, "order-3", 300, 1)
 	_ = coord.Run(ctx, "task-3", "order-3", steps3)
 	why("扣款响应丢失，任务暂停等待核实；此时收到互相矛盾的两张收据，立案争议")
@@ -269,4 +269,42 @@ func main() {
 	}
 	showDispute(dstore, disp.ID)
 	why("记录说明：矛盾证据未消除前任务保持 paused；恢复需人工 Resume 且门禁放行")
+
+	fmt.Println()
+	fmt.Println("=== 场景四：裁决范围的局部补充 ===")
+	disp4, err := dm.Open(ctx, "task-4", "charge", "裁决只覆盖退款，释放许可待补充")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := dm.AddObservation(ctx, disp4.ID, "支付网关", "failed", "扣款明确失败"); err != nil {
+		log.Fatal(err)
+	}
+	disp4, _ = dstore.Load(ctx, disp4.ID)
+	if _, err := dm.Rule(ctx, disp4.ID, "refund", nil, []string{disp4.Observations[0].ID}, "operator-A"); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := dm.ExecuteAction(ctx, disp4.ID, "refund"); err != nil {
+		log.Fatal(err)
+	}
+	why("裁决只覆盖 refund 并已执行；release 尚未被授权")
+	if _, err := dm.AddObservation(ctx, disp4.ID, "仓库", "failed", "货物从未发出", "release"); err != nil {
+		log.Fatal(err)
+	}
+	preview, _ := dm.PreviewSupplement(ctx, disp4.ID, []string{"release"}, nil)
+	why("预览补充：已执行 %v，可新增许可 %v，仍受约束 %v", preview.ExecutedActions, preview.AddEffective, preview.StillUnderRuling)
+	disp4, _ = dstore.Load(ctx, disp4.ID)
+	if _, err := dm.ConfirmSupplement(ctx, disp4.ID, coordinator.SupplementRequest{
+		Add: []string{"release"}, Basis: []string{disp4.Observations[1].ID},
+		Reason: "仓库证实未发货，追加释放许可", By: "operator-B",
+		ExpectRulingVersion: preview.RulingVersion, ExpectEvidenceVersion: preview.EvidenceVersion,
+	}); err != nil {
+		log.Fatal(err)
+	}
+	why("确认补充后 release 获准；版本过期或证据撤回后的迟到确认会被拒绝")
+	if _, err := dm.AddObservation(ctx, disp4.ID, "银行", "success", "又出现一笔成功扣款", "refund"); err != nil {
+		log.Fatal(err)
+	}
+	disp4, _ = dstore.Load(ctx, disp4.ID)
+	why("新证据只暂停其涉及且矛盾的范围（refund 已执行不受影响），release 仍可执行: %v", dm.CheckAction(ctx, disp4.ID, "release"))
+	showDispute(dstore, disp4.ID)
 }
