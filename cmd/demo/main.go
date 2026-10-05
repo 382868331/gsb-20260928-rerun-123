@@ -6,8 +6,8 @@ package main
 
 import (
 	"context"
-    "encoding/json"
-    "fmt"
+	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,10 +17,10 @@ import (
 
 // fakeLedger 是虚构的账务服务，可脚本化"丢响应"。
 type fakeLedger struct {
-    balance    int
-    charged    map[string]int
-    loseReply  bool
-    loseQuery  bool
+	balance   int
+	charged   map[string]int
+	loseReply bool
+	loseQuery bool
 }
 
 func (l *fakeLedger) charge(key string, amount int) coordinator.Op {
@@ -38,12 +38,12 @@ func (l *fakeLedger) charge(key string, amount int) coordinator.Op {
 			}
 			return coordinator.Success, fmt.Sprintf("charged %d", amount), nil
 		},
-        Query: func(ctx context.Context) (coordinator.Outcome, string, error) {
-            if l.loseQuery {
-                l.loseQuery = false
-                return coordinator.Unknown, "", coordinator.ErrUnknownResult
-            }
-            if amt, ok := l.charged[key]; ok {
+		Query: func(ctx context.Context) (coordinator.Outcome, string, error) {
+			if l.loseQuery {
+				l.loseQuery = false
+				return coordinator.Unknown, "", coordinator.ErrUnknownResult
+			}
+			if amt, ok := l.charged[key]; ok {
 				return coordinator.Success, fmt.Sprintf("query: charge of %d found", amt), nil
 			}
 			return coordinator.Failed, "query: no charge found", nil
@@ -182,11 +182,11 @@ func main() {
 	ledger := &fakeLedger{balance: 1000}
 	inv := &fakeInventory{stock: 10}
 	order := &fakeOrder{}
-    ledger.loseReply = true // 扣款实际成功，但响应丢失
-    ledger.loseQuery = true // 第一次查询的响应也丢失
+	ledger.loseReply = true // 扣款实际成功，但响应丢失
+	ledger.loseQuery = true // 第一次查询的响应也丢失
 	steps := orderSteps(ledger, inv, order, "order-1", 100, 2)
-    err = coord.Run(ctx, "task-1", "order-1", steps)
-    why("第一次 Run 返回: %v（扣款响应丢失 -> 查询核实，查询响应也丢失 -> 暂停等待）", err)
+	err = coord.Run(ctx, "task-1", "order-1", steps)
+	why("第一次 Run 返回: %v（扣款响应丢失 -> 查询核实，查询响应也丢失 -> 暂停等待）", err)
 	showTask(coord, store, "task-1")
 	why("查询确认扣款已发生，因此可以继续；恢复任务后跑完预留与提交")
 	ledger.loseReply = false
@@ -215,8 +215,8 @@ func main() {
 	ledger3 := &fakeLedger{balance: 1000}
 	inv3 := &fakeInventory{stock: 10}
 	order3 := &fakeOrder{}
-    ledger3.loseReply = true
-    ledger3.loseQuery = true // 查询响应也丢失，任务停在 paused 等待核实
+	ledger3.loseReply = true
+	ledger3.loseQuery = true // 查询响应也丢失，任务停在 paused 等待核实
 	steps3 := orderSteps(ledger3, inv3, order3, "order-3", 300, 1)
 	_ = coord.Run(ctx, "task-3", "order-3", steps3)
 	why("扣款响应丢失，任务暂停等待核实；此时收到互相矛盾的两张收据，立案争议")
@@ -269,4 +269,45 @@ func main() {
 	}
 	showDispute(dstore, disp.ID)
 	why("记录说明：矛盾证据未消除前任务保持 paused；恢复需人工 Resume 且门禁放行")
+
+	fmt.Println()
+	fmt.Println("=== 场景四：局部补充——已退款后追加 release 许可，独立动作不被连带暂停 ===")
+	disp4, err := dm.Open(ctx, "task-4", "charge", "退款后需局部追加释放库存许可")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := dm.AddObservation(ctx, disp4.ID, "支付网关", "failed", "扣款明确失败"); err != nil {
+		log.Fatal(err)
+	}
+	disp4, _ = dstore.Load(ctx, disp4.ID)
+	if _, err := dm.Rule(ctx, disp4.ID, "refund", []string{"notify"}, []string{disp4.Observations[0].ID}, "operator-A"); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := dm.ExecuteAction(ctx, disp4.ID, "refund"); err != nil {
+		log.Fatal(err)
+	}
+	why("裁决只授权 refund+notify；refund 已发生，release 尚未获准")
+	pv, err := dm.AddScopedEvidence(ctx, disp4.ID, "库存系统", "success", "库存预留已核实，可安全释放",
+		[]string{"release"}, []string{"release"}, nil, "退款完成，追加释放库存许可", "operator-A")
+	if err != nil {
+		log.Fatal(err)
+	}
+	// 把补充证据结论改为可核实的 success（预览确认后成为 release 的已核实基础）。
+	why("预览：已发生=%v 获准=%v 受限=%v", pv.Done, pv.Permitted, pv.Restricted)
+	if err := dm.CheckAction(ctx, disp4.ID, "release"); err != nil {
+		why("确认前 release 被旧裁决拦住: %v", err)
+	}
+	if _, err := dm.ConfirmSupplement(ctx, pv.ChangeID, "operator-A"); err != nil {
+		log.Fatal(err)
+	}
+	why("确认后 release 获准；重复执行 refund 仍被拒：%v", dm.CheckAction(ctx, disp4.ID, "refund"))
+
+	// 只与 release 矛盾的证据：notify 独立继续。
+	if _, err := dm.AddScopedEvidence(ctx, disp4.ID, "仓库", "failed", "释放前提不成立，库存状态冲突",
+		[]string{"release"}, nil, nil, "临时 hold release", "operator-B"); err != nil {
+		log.Fatal(err)
+	}
+	why("release: %v（局部暂停）；notify: %v（独立动作继续）",
+		dm.CheckAction(ctx, disp4.ID, "release"), dm.CheckAction(ctx, disp4.ID, "notify"))
+	showDispute(dstore, disp4.ID)
 }
